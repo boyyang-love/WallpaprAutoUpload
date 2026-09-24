@@ -3,15 +3,20 @@ set -euo pipefail
 
 ###############################################################################
 #  WallpaperAutoUploadTool 打包分发脚本
-#  Build + Sign + DMG
+#  Build + Sign + Notarize + DMG
 #
 #  用法:
 #    ./scripts/distribute.sh              # 交互式，一键分发
 #    ./scripts/distribute.sh --check-only # 只检查环境，不做构建
+#    ./scripts/distribute.sh --setup      # 只打印环境指导
 #
 #  先决条件:
 #    1. Apple Developer Program（$99/年） https://developer.apple.com/programs/
 #    2. 开发者证书已安装到钥匙串（见下文指引）
+#    3. App Store Connect API Key（推荐）或 Apple ID + 专用密码
+#
+#  首次使用流程:
+#    ./scripts/distribute.sh --setup       # 只打印环境指导和检查项目配置
 ###############################################################################
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -86,6 +91,35 @@ check_environment() {
         echo "$IDENTITIES" | while IFS= read -r line; do
             echo "       $(echo "$line" | sed 's/^[^"]*"//; s/"$//')"
         done
+    fi
+
+    # 项目签名配置检查
+    echo ""
+    info "项目签名配置 (pbxproj 中的 target buildSettings):"
+    grep -E "(CODE_SIGN_STYLE|DEVELOPMENT_TEAM|ENABLE_APP_SANDBOX|ENABLE_HARDENED_RUNTIME) " "$PROJECT_DIR/$PROJECT/project.pbxproj" || true
+
+    # 自动签名模式检查
+    if grep -qE "CODE_SIGN_STYLE = Automatic" "$PROJECT_DIR/$PROJECT/project.pbxproj" 2>/dev/null; then
+        ok "签名模式: Automatic (Xcode 自动管理证书)"
+    fi
+
+    # Hardened Runtime
+    if grep -qE "ENABLE_HARDENED_RUNTIME = YES" "$PROJECT_DIR/$PROJECT/project.pbxproj" 2>/dev/null; then
+        ok "Hardened Runtime 已启用 (公证要求)"
+    else
+        warn "Hardened Runtime 未启用 (公证要求必须启用)"
+    fi
+
+    # notarytool 检查
+    if xcrun notarytool --version &>/dev/null; then
+        ok "notarytool 可用"
+    else
+        warn "notarytool 不可用 (需要 Xcode 13+ 或 Command Line Tools)"
+    fi
+
+    # App Store Connect API Key 检查
+    if [[ -f ~/private_keys/AuthKey_*.p8 ]] 2>/dev/null; then
+        ok "App Store Connect API Key 已找到"
     fi
 }
 
@@ -175,7 +209,76 @@ verify_signature() {
 }
 
 # ============================================================================
-#  步骤 4：打包 DMG
+#  步骤 4：公证（Notarization）
+# ============================================================================
+
+notarize() {
+    echo ""
+    info "=========== 提交公证 ==========="
+
+    # 打包 .app 为 .zip（notarytool 要求）
+    info "正在打包 .app 为 .zip..."
+    ZIP_PATH="$EXPORT_DIR/WallpaperAutoUploadTool.zip"
+    ditto -c -k --keepParent "$EXPORT_DIR/$APP_NAME" "$ZIP_PATH"
+
+    # 尝试从 ~/private_keys 读取 App Store Connect API Key
+    AUTH_KEY=$(ls ~/private_keys/AuthKey_*.p8 2>/dev/null | head -1 || true)
+
+    if [[ -n "$AUTH_KEY" ]]; then
+        KEY_ID=$(basename "$AUTH_KEY" | sed 's/AuthKey_//;s/\.p8//')
+        info "使用 App Store Connect API Key: $KEY_ID"
+        xcrun notarytool submit "$ZIP_PATH" \
+            --key "$AUTH_KEY" \
+            --key-id "$KEY_ID" \
+            --issuer "$(security find-generic-password -a "$KEY_ID" -w 2>/dev/null || echo 'YOUR_ISSUER_ID')" \
+            --wait \
+            --timeout 10m \
+            2>&1 | tee /dev/stderr | grep -E "status|id:" || true
+    else
+        warn "未找到 App Store Connect API Key"
+        warn "请使用 Apple ID 方式进行公证:"
+        echo ""
+        echo "  xcrun notarytool submit \"$ZIP_PATH\" \\"
+        echo "    --apple-id \"your@apple.id\" \\"
+        echo "    --team-id \"52D2N3R5W8\" \\"
+        echo "    --password \"@keychain:AC_PASSWORD\" \\"
+        echo "    --wait"
+        echo ""
+        warn "请先创建 app-specific password: https://appleid.apple.com/account/manage"
+        echo "然后添加到钥匙串: xcrun notarytool store-credentials WallpaperNotary --apple-id ... --team-id 52D2N3R5W8"
+
+        # 如果已经存了凭证
+        if xcrun notarytool history --keychain-profile "WallpaperNotary" &>/dev/null; then
+            info "发现已保存的公证凭证 WallpaperNotary，正在提交..."
+            xcrun notarytool submit "$ZIP_PATH" \
+                --keychain-profile "WallpaperNotary" \
+                --wait \
+                --timeout 10m
+        fi
+    fi
+
+    # 清理 zip
+    rm -f "$ZIP_PATH"
+}
+
+# ============================================================================
+#  步骤 5：钉票（Staple）
+# ============================================================================
+
+staple() {
+    echo ""
+    info "=========== 钉票 ==========="
+
+    xcrun stapler staple "$EXPORT_DIR/$APP_NAME" && \
+        ok "公证票据已钉入 .app" || \
+        warn "钉票失败（可能公证尚未完成）"
+
+    # 再次验证
+    spctl --assess --verbose=4 "$EXPORT_DIR/$APP_NAME" 2>&1 | head -5
+}
+
+# ============================================================================
+#  步骤 6：打包 DMG
 # ============================================================================
 
 make_dmg() {
@@ -218,10 +321,20 @@ print_guide() {
     echo "    developer.apple.com → Certificates → + → Developer ID Application"
     echo "    下载并双击安装到钥匙串"
     echo ""
-    echo " 3. 运行完整分发流程:"
+    echo " 3. 创建 App Store Connect API Key（推荐，免密码交互）"
+    echo "    appstoreconnect.apple.com → 用户和访问 → 密钥 → +"
+    echo "    下载 .p8 文件放到 ~/private_keys/"
+    echo ""
+    echo "    或创建 app-specific password + 保存到钥匙串:"
+    echo "    https://appleid.apple.com/account/manage → App-Specific Passwords"
+    echo "    xcrun notarytool store-credentials WallpaperNotary \\"
+    echo "      --apple-id \"your@email.com\" \\"
+    echo "      --team-id \"52D2N3R5W8\""
+    echo ""
+    echo " 4. 运行完整分发流程:"
     echo "    ./scripts/distribute.sh"
     echo ""
-    echo " 4. 分发产物"
+    echo " 5. 分发产物"
     echo "    DMG: $DMG_PATH"
     echo "    或直接分发: $EXPORT_DIR/$APP_NAME (需要先 zip)"
     echo ""
@@ -258,6 +371,18 @@ main() {
     archive
     export_app
     verify_signature
+
+    echo ""
+    warn "是否继续提交公证? (y/n)"
+    echo "  公证需要联网，且首次使用可能需要配置 API Key 或 Apple ID"
+    read -r CONTINUE
+    if [[ "$CONTINUE" == "y" || "$CONTINUE" == "Y" ]]; then
+        notarize
+        staple
+    else
+        warn "跳过公证。签名的 .app 仍可在本地使用，但分发给其他 Mac 会触发 Gatekeeper 警告"
+    fi
+
     make_dmg
 
     echo ""
@@ -265,6 +390,11 @@ main() {
     echo ""
     echo "  DMG:  $DMG_PATH"
     echo "  .app: $EXPORT_DIR/$APP_NAME"
+    echo ""
+    echo "  分发给用户后，他们只需:"
+    echo "    1. 打开 DMG"
+    echo "    2. 拖 WallpaperAutoUploadTool.app 到 Applications"
+    echo "    3. 首次启动时在 系统设置 → 隐私与安全性 中允许运行"
     echo ""
 
     print_guide
