@@ -10,9 +10,12 @@ import SwiftData
 
 @main
 struct WallpaperAutoUploadToolApp: App {
+    @State private var settings = AppSettings()
+
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            UploadRecord.self,
+            UploadRecordItem.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
@@ -26,6 +29,7 @@ struct WallpaperAutoUploadToolApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environment(settings)
         }
         .modelContainer(sharedModelContainer)
     }

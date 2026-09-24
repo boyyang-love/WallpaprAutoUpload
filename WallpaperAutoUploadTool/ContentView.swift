@@ -6,54 +6,52 @@
 //
 
 import SwiftUI
-import SwiftData
+
+/// 侧栏导航项
+private enum SidebarItem: String, CaseIterable, Identifiable {
+    case upload = "上传任务"
+    case settings = "设置"
+    case history = "历史记录"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .upload: return "arrow.up.circle"
+        case .settings: return "gearshape"
+        case .history: return "clock.arrow.circlepath"
+        }
+    }
+}
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @State private var selection: SidebarItem? = .upload
 
     var body: some View {
         NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
-                }
-                .onDelete(perform: deleteItems)
+            List(SidebarItem.allCases, selection: $selection) { item in
+                Label(item.rawValue, systemImage: item.icon)
+                    .tag(item)
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-            .toolbar {
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
-            }
+            .navigationSplitViewColumnWidth(min: 160, ideal: 180)
         } detail: {
-            Text("Select an item")
-        }
-    }
-
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
+            switch selection {
+            case .upload:
+                UploadView()
+            case .settings:
+                SettingsView()
+            case .history:
+                HistoryView()
+            case .none:
+                Text("请选择功能")
+                    .foregroundStyle(.secondary)
             }
         }
+        .frame(minWidth: 800, minHeight: 500)
     }
 }
 
 #Preview {
     ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
+        .environment(AppSettings())
 }
