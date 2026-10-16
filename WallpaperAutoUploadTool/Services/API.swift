@@ -10,17 +10,7 @@ import AppKit
 
 // MARK: - Models
 
-struct TagRecord: Codable {
-    let id: String
-    let name: String
-}
-
-struct CategoryRecord: Codable {
-    let id: String
-    let name: String
-}
-
-struct RecommendRecord: Codable {
+struct PaginatedRecord: Codable {
     let id: String
     let name: String
 }
@@ -35,21 +25,66 @@ struct PaginatedData<T: Codable>: Codable {
     let records: [T]
 }
 
-struct UploadData: Codable {
-    let id: String?
-}
+struct ImageAnalysis: Equatable {
+    /// 字段类型：字符串或字符串数组
+    enum FieldValue: Equatable {
+        case string(String)
+        case array([String])
 
-struct ImageAnalysis: Codable {
-    var name: String
-    var description: String
-    var seoName: String
-    var category: String
-    var tags: [String]
-    var recommend: [String]
+        var isEmpty: Bool {
+            switch self {
+            case .string(let s): return s.isEmpty
+            case .array(let a): return a.isEmpty
+            }
+        }
+    }
 
-    enum CodingKeys: String, CodingKey {
-        case name, description, category, tags, recommend
-        case seoName = "seo_name"
+    /// 有序字段列表（保持插入顺序用于 UI 显示）
+    private(set) var orderedFields: [(key: String, value: FieldValue)]
+
+    /// 字段字典（用于快速查找）
+    private var fieldMap: [String: FieldValue]
+
+    init(fields: [String: Any]) {
+        var ordered: [(String, FieldValue)] = []
+        var map: [String: FieldValue] = [:]
+        for (k, v) in fields {
+            let fv: FieldValue
+            if let arr = v as? [String] {
+                fv = .array(arr)
+            } else {
+                fv = .string("\(v)")
+            }
+            ordered.append((k, fv))
+            map[k] = fv
+        }
+        self.orderedFields = ordered.sorted { $0.0 < $1.0 }
+        self.fieldMap = map
+    }
+
+    static func == (lhs: ImageAnalysis, rhs: ImageAnalysis) -> Bool {
+        guard lhs.orderedFields.count == rhs.orderedFields.count else { return false }
+        for (l, r) in zip(lhs.orderedFields, rhs.orderedFields) {
+            if l.key != r.key || l.value != r.value { return false }
+        }
+        return true
+    }
+
+    func string(_ key: String) -> String {
+        if case .string(let s) = fieldMap[key] { return s }
+        return ""
+    }
+
+    func array(_ key: String) -> [String] {
+        if case .array(let a) = fieldMap[key] { return a }
+        return []
+    }
+
+    func valueForField(_ fieldName: String, separator: String? = nil) -> String {
+        if let sep = separator {
+            return array(fieldName).joined(separator: sep)
+        }
+        return string(fieldName)
     }
 }
 
@@ -107,14 +142,11 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate, UR
     }
 }
 
-// MARK: - Wallpaper API Client
+// MARK: - Generic API Client
 
-final class WallpaperAPIClient {
+final class APIClient {
     private let baseURL: String
     private let client: URLSession
-    private var cachedTags: [TagRecord] = []
-    private var cachedCategories: [CategoryRecord] = []
-    private var cachedRecommends: [RecommendRecord] = []
 
     init(baseURL: String, token: String) {
         self.baseURL = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -124,106 +156,67 @@ final class WallpaperAPIClient {
         self.client = URLSession(configuration: config)
     }
 
-    // MARK: Fetch existing data
+    // MARK: - Entity CRUD
 
-    func fetchTags() async throws -> [TagRecord] {
-        if !cachedTags.isEmpty { return cachedTags }
-        let resp: APIResponse<PaginatedData<TagRecord>> = try await get("/tag/info", params: ["page": "1", "limit": "10000"])
-        cachedTags = resp.data?.records ?? []
-        return cachedTags
+    /// 获取实体列表（标签/分类/推荐等通用接口）
+    func listEntities(path: String) async throws -> [PaginatedRecord] {
+        do {
+            let resp: APIResponse<PaginatedData<PaginatedRecord>> = try await get(path, params: ["page": "1", "limit": "10000"])
+            return resp.data?.records ?? []
+        } catch {
+            print("⚠️ listEntities(\(path)) 失败: \(error)")
+            return []
+        }
     }
 
-    func fetchCategories() async throws -> [CategoryRecord] {
-        if !cachedCategories.isEmpty { return cachedCategories }
-        let resp: APIResponse<PaginatedData<CategoryRecord>> = try await get("/category/info", params: ["page": "1", "limit": "10000"])
-        cachedCategories = resp.data?.records ?? []
-        return cachedCategories
+    /// 创建实体
+    @discardableResult
+    func createEntity(path: String, body: [String: String]) async throws -> Data {
+        try await postRaw(path, body: body)
     }
 
-    func fetchRecommends() async throws -> [RecommendRecord] {
-        if !cachedRecommends.isEmpty { return cachedRecommends }
-        let resp: APIResponse<PaginatedData<RecommendRecord>> = try await get("/recommend/info", params: ["page": "1", "limit": "10000"])
-        cachedRecommends = resp.data?.records ?? []
-        return cachedRecommends
+    /// 匹配已有实体或创建新实体，返回 ID
+    func matchOrCreate(name: String, listPath: String, createPath: String, createBody: [String: String]) async throws -> String {
+        let existing = try await listEntities(path: listPath)
+        if let match = existing.first(where: { $0.name == name }) {
+            return match.id
+        }
+        // 构建请求体，替换 {{name}} 占位符
+        var body = createBody
+        for (key, value) in body {
+            body[key] = value.replacingOccurrences(of: "{{name}}", with: name)
+        }
+        do {
+            try await createEntity(path: createPath, body: body)
+        } catch {
+            print("⚠️ createEntity(\(createPath)) 失败: \(error)")
+            return ""
+        }
+        // 重新查询获取 ID
+        let refreshed = try await listEntities(path: listPath)
+        return refreshed.first(where: { $0.name == name })?.id ?? ""
     }
 
-    // MARK: Match or create
-
-    func matchOrCreateTag(_ name: String) async throws -> String {
-        let tags = try await fetchTags()
-        if let existing = tags.first(where: { $0.name == name }) { return existing.id }
-        return try await createTag(name).id
-    }
-
-    func matchOrCreateCategory(_ name: String) async throws -> String {
-        let cats = try await fetchCategories()
-        if let existing = cats.first(where: { $0.name == name }) { return existing.id }
-        return try await createCategory(name).id
-    }
-
-    func matchOrCreateRecommend(_ name: String) async throws -> String {
-        let recs = try await fetchRecommends()
-        if let existing = recs.first(where: { $0.name == name }) { return existing.id }
-        return try await createRecommend(name).id
-    }
-
-    // MARK: Create
-
-    private func createTag(_ name: String) async throws -> TagRecord {
-        try await postRaw("/tag/create", body: [
-            "name": name, "type": "wallpaper", "sort": "0"
-        ])
-        cachedTags = []
-        let tags = try await fetchTags()
-        return tags.first(where: { $0.name == name }) ?? TagRecord(id: "", name: name)
-    }
-
-    private func createCategory(_ name: String) async throws -> CategoryRecord {
-        try await postRaw("/category/create", body: [
-            "name": name, "cover_id": "", "cover": "", "sort": "0", "web": "true", "moa": "true"
-        ])
-        cachedCategories = []
-        let cats = try await fetchCategories()
-        return cats.first(where: { $0.name == name }) ?? CategoryRecord(id: "", name: name)
-    }
-
-    private func createRecommend(_ name: String) async throws -> RecommendRecord {
-        try await postRaw("/recommend/create", body: [
-            "name": name, "sort": "0"
-        ])
-        cachedRecommends = []
-        let recs = try await fetchRecommends()
-        return recs.first(where: { $0.name == name }) ?? RecommendRecord(id: "", name: name)
-    }
-
-    // MARK: Upload
+    // MARK: - Image Upload
 
     func uploadImage(
-        filePath: String, fileName: String, type: String,
-        quality: Int, status: Int, rootDir: String, dir: String,
-        bucketName: String, tagIDs: [String],
-        categoryIDs: [String], recommendIDs: [String],
+        uploadPath: String,
+        filePath: String,
+        fields: [String: String],
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> String {
         let imageData = try Data(contentsOf: URL(fileURLWithPath: filePath))
         let ext = (filePath as NSString).pathExtension.lowercased()
         let mime = ext == "png" ? "image/png" : ext == "webp" ? "image/webp" : "image/jpeg"
-        let uploadName = fileName + "." + ext
+        let fileName = (filePath as NSString).lastPathComponent
 
-        let fields: [String: String] = [
-            "file_name": fileName, "root_dir": rootDir, "dir": dir,
-            "bucket_name": bucketName, "quality": "\(quality)", "status": "\(status)",
-            "type": type, "tags": tagIDs.joined(separator: ","),
-            "category": categoryIDs.joined(separator: ","),
-            "recommend": recommendIDs.joined(separator: ","),
-            "group": "", "album": "",
-        ]
+        print("📤 上传字段: \(fields)")
 
         let boundary = "----Boundary\(UUID().uuidString)"
         let body = buildMultipartBody(fields: fields, fileData: imageData,
-                                      fileName: uploadName, mimeType: mime)(boundary)
+                                      fileName: fileName, mimeType: mime)(boundary)
 
-        var request = URLRequest(url: URL(string: "\(baseURL)/image/upload")!)
+        var request = URLRequest(url: URL(string: "\(baseURL)\(uploadPath)")!)
         request.httpMethod = "POST"
         request.timeoutInterval = 120
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -247,7 +240,6 @@ final class WallpaperAPIClient {
             throw APIError.serverError(code, msg)
         }
 
-        // 先检查响应是否是有效 JSON
         let raw = String(data: data, encoding: .utf8) ?? "<binary>"
         print("🔍 上传原始响应: \(raw.prefix(300))")
 
@@ -265,19 +257,26 @@ final class WallpaperAPIClient {
         throw APIError.serverError(code, msg)
     }
 
-    // MARK: Private helpers
+    // MARK: - Private helpers
 
     private func get<T: Codable>(_ path: String, params: [String: String]? = nil) async throws -> T {
         var components = URLComponents(string: baseURL + path)!
         if let params = params {
             components.queryItems = params.map { URLQueryItem(name: $0.key, value: $0.value) }
         }
-        let (data, _) = try await client.data(from: components.url!)
-        return try JSONDecoder().decode(T.self, from: data)
-    }
+        let url = components.url!
+        print("🌐 GET \(url)")
+        let (data, response) = try await client.data(from: url)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let raw = String(data: data, encoding: .utf8) ?? ""
+        print("📥 响应 [\(statusCode)]: \(raw.prefix(200))")
 
-    private func post<T: Codable>(_ path: String, body: [String: String]) async throws -> T {
-        let data = try await postRaw(path, body: body)
+        guard (200...299).contains(statusCode) else {
+            throw APIError.serverError(statusCode, raw.isEmpty ? nil : raw)
+        }
+        guard !data.isEmpty else {
+            throw APIError.serverError(statusCode, "空响应")
+        }
         return try JSONDecoder().decode(T.self, from: data)
     }
 
@@ -317,8 +316,6 @@ final class WallpaperAPIClient {
     }
 }
 
-private struct EmptyData: Codable {}
-
 // MARK: - Vision AI Client
 
 final class VisionAIClient {
@@ -336,7 +333,7 @@ final class VisionAIClient {
         self.client = URLSession(configuration: config)
     }
 
-    func analyze(imagePath: String, prompt: String) async throws -> ImageAnalysis {
+    func analyze(imagePath: String, prompt: String, outputFields: [WorkflowConfig.OutputField]) async throws -> ImageAnalysis {
         let imageData = try Data(contentsOf: URL(fileURLWithPath: imagePath))
         let b64 = imageData.base64EncodedString()
         let ext = (imagePath as NSString).pathExtension.lowercased()
@@ -364,11 +361,14 @@ final class VisionAIClient {
 
         let (data, _) = try await client.data(for: request)
 
+        let rawResponse = String(data: data, encoding: .utf8) ?? "<binary>"
+        print("🤖 AI 原始响应: \(rawResponse.prefix(500))")
+
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = json["choices"] as? [[String: Any]],
               let message = choices.first?["message"] as? [String: Any]
         else {
-            return ImageAnalysis(name: "", description: "", seoName: "", category: "", tags: [], recommend: [])
+            return ImageAnalysis(fields: [:])
         }
 
         var content = message["content"] as? String ?? ""
@@ -377,14 +377,13 @@ final class VisionAIClient {
             content = reasoning
         }
 
-        let analysis = try parseAIResponse(content)
-        return analysis
+        return parseAIResponse(content, outputFields: outputFields)
     }
 
-    private func parseAIResponse(_ content: String) throws -> ImageAnalysis {
+    private func parseAIResponse(_ content: String, outputFields: [WorkflowConfig.OutputField]) -> ImageAnalysis {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // 尝试从 markdown 代码块提取
+        // Try extracting from markdown code block
         if trimmed.contains("```") {
             let lines = trimmed.components(separatedBy: "\n")
             var jsonLines: [String] = []
@@ -400,18 +399,18 @@ final class VisionAIClient {
             }
             if !jsonLines.isEmpty {
                 let candidate = jsonLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-                if let result = try? JSONDecoder().decode(ImageAnalysis.self, from: Data(candidate.utf8)) {
+                if let result = parseJSONString(candidate, outputFields: outputFields) {
                     return result
                 }
             }
         }
 
-        // 直接解析
-        if let result = try? JSONDecoder().decode(ImageAnalysis.self, from: Data(trimmed.utf8)) {
+        // Try direct parse
+        if let result = parseJSONString(trimmed, outputFields: outputFields) {
             return result
         }
 
-        // 从后往前找完整的 JSON 对象
+        // Try finding JSON object from the end
         var end = trimmed.endIndex
         while end > trimmed.startIndex {
             guard let lastBrace = trimmed[..<end].lastIndex(of: "}") else { break }
@@ -425,13 +424,33 @@ final class VisionAIClient {
             }
             if depth == 0 {
                 let candidate = String(trimmed[start...lastBrace])
-                if let result = try? JSONDecoder().decode(ImageAnalysis.self, from: Data(candidate.utf8)) {
+                if let result = parseJSONString(candidate, outputFields: outputFields) {
                     return result
                 }
             }
             end = start
         }
 
-        return ImageAnalysis(name: "", description: "", seoName: "", category: "", tags: [], recommend: [])
+        return ImageAnalysis(fields: [:])
+    }
+
+    private func parseJSONString(_ str: String, outputFields: [WorkflowConfig.OutputField]) -> ImageAnalysis? {
+        guard let data = str.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        var fields: [String: Any] = [:]
+        for field in outputFields {
+            if let value = json[field.name] {
+                fields[field.name] = value
+            }
+        }
+        guard !fields.isEmpty else {
+            print("⚠️ parseJSONString: 没有匹配到任何 outputFields")
+            return nil
+        }
+        print("✅ parseJSONString: 提取到 \(fields.count) 个字段: \(fields.keys.sorted())")
+        return ImageAnalysis(fields: fields)
     }
 }

@@ -27,6 +27,7 @@ PROJECT="WallpaperAutoUploadTool.xcodeproj"
 CONFIGURATION="Release"
 
 BUNDLE_ID="com.boyyang.WallpaperAutoUploadTool"
+TEAM_ID="${TEAM_ID:-52D2N3R5W8}"
 ARCHIVE_PATH="$PROJECT_DIR/dist/WallpaperAutoUploadTool.xcarchive"
 EXPORT_DIR="$PROJECT_DIR/dist/Export"
 DMG_PATH="$PROJECT_DIR/dist/WallpaperAutoUploadTool.dmg"
@@ -245,7 +246,7 @@ notarize() {
         echo "    --wait"
         echo ""
         warn "请先创建 app-specific password: https://appleid.apple.com/account/manage"
-        echo "然后添加到钥匙串: xcrun notarytool store-credentials WallpaperNotary --apple-id ... --team-id 52D2N3R5W8"
+        echo "然后添加到钥匙串: xcrun notarytool store-credentials WallpaperNotary --apple-id ... --team-id ${TEAM_ID:-YOUR_TEAM_ID}"
 
         # 如果已经存了凭证
         if xcrun notarytool history --keychain-profile "WallpaperNotary" &>/dev/null; then

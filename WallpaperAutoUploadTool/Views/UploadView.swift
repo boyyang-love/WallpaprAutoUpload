@@ -263,44 +263,53 @@ private struct ImageCard: View {
         VStack(alignment: .leading, spacing: 4) {
             Divider()
 
-            // 名称
-            if !analysis.name.isEmpty {
-                Text(analysis.name)
-                    .font(.caption)
-                    .lineLimit(1)
-            }
+            // 动态显示所有分析字段
+            ForEach(analysis.orderedFields.indices, id: \.self) { index in
+                let field = analysis.orderedFields[index]
 
-            // 分类
-            if !analysis.category.isEmpty {
-                HStack(spacing: 4) {
-                    Image(systemName: "folder")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text(analysis.category)
-                        .font(.caption2)
-                }
-            }
+                switch field.value {
+                case .string(let strValue):
+                    if !strValue.isEmpty {
+                        if field.key == "name" {
+                            Text(strValue)
+                                .font(.caption)
+                                .lineLimit(1)
+                        } else if field.key.contains("seo") {
+                            Text(strValue)
+                                .font(.system(size: 9))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        } else {
+                            HStack(spacing: 4) {
+                                Text(field.key)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Text(strValue)
+                                    .font(.caption2)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
 
-            // 标签
-            if !analysis.tags.isEmpty {
-                LazyVGrid(columns: tagColumns, alignment: .leading, spacing: 3) {
-                    ForEach(analysis.tags.prefix(8), id: \.self) { tag in
-                        Text(tag)
-                            .font(.system(size: 9))
-                            .lineLimit(1)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 2)
-                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                case .array(let arrValue):
+                    if !arrValue.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(field.key)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            LazyVGrid(columns: tagColumns, alignment: .leading, spacing: 3) {
+                                ForEach(arrValue.prefix(8), id: \.self) { item in
+                                    Text(item)
+                                        .font(.system(size: 9))
+                                        .lineLimit(1)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 2)
+                                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                                }
+                            }
+                        }
                     }
                 }
-            }
-
-            // SEO 名
-            if !analysis.seoName.isEmpty {
-                Text(analysis.seoName)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
             }
         }
     }

@@ -35,7 +35,7 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(aiTimeout, forKey: Keys.aiTimeout) }
     }
 
-    // MARK: - 上传配置
+    // MARK: - 通用上传配置
 
     var uploadQuality: Int {
         didSet { UserDefaults.standard.set(uploadQuality, forKey: Keys.uploadQuality) }
@@ -49,40 +49,134 @@ final class AppSettings {
     var uploadBucket: String {
         didSet { UserDefaults.standard.set(uploadBucket, forKey: Keys.uploadBucket) }
     }
+    var uploadRootDir: String {
+        didSet { UserDefaults.standard.set(uploadRootDir, forKey: Keys.uploadRootDir) }
+    }
+
+    // MARK: - 工作流配置
+
+    /// 当前选中的工作流 JSON 字符串
+    var selectedWorkflow: String {
+        didSet { UserDefaults.standard.set(selectedWorkflow, forKey: Keys.selectedWorkflow) }
+    }
+
+    /// 解析后的工作流配置（只读计算属性）
+    var workflow: WorkflowConfig? {
+        guard let data = selectedWorkflow.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return WorkflowConfig(json: json)
+    }
+
+    /// 是否已完成初始配置（至少填了 API 地址和 Token）
+    var isConfigured: Bool {
+        !apiBaseURL.trimmingCharacters(in: .whitespaces).isEmpty &&
+        !apiToken.trimmingCharacters(in: .whitespaces).isEmpty
+    }
 
     // MARK: - Init
 
     init() {
         let defaults = UserDefaults.standard
 
-        // 注册默认值
         defaults.register(defaults: [
-            Keys.apiBaseURL: Defaults.apiBaseURL,
+            Keys.apiBaseURL: "",
             Keys.apiToken: "",
-            Keys.aiBaseURL: Defaults.aiBaseURL,
+            Keys.aiBaseURL: "",
             Keys.aiAPIKey: "",
-            Keys.aiModel: Defaults.aiModel,
-            Keys.aiTimeout: Defaults.aiTimeout,
-            Keys.uploadQuality: Defaults.uploadQuality,
-            Keys.uploadStatus: Defaults.uploadStatus,
-            Keys.uploadDir: Defaults.uploadDir,
-            Keys.uploadBucket: Defaults.uploadBucket,
+            Keys.aiModel: "",
+            Keys.aiTimeout: 60,
+            Keys.uploadQuality: 5,
+            Keys.uploadStatus: 1,
+            Keys.uploadDir: "",
+            Keys.uploadBucket: "",
+            Keys.uploadRootDir: "IMAGES",
         ])
 
-        self.apiBaseURL = defaults.string(forKey: Keys.apiBaseURL) ?? Defaults.apiBaseURL
+        self.apiBaseURL = defaults.string(forKey: Keys.apiBaseURL) ?? ""
         self.apiToken = defaults.string(forKey: Keys.apiToken) ?? ""
-        self.aiBaseURL = defaults.string(forKey: Keys.aiBaseURL) ?? Defaults.aiBaseURL
+        self.aiBaseURL = defaults.string(forKey: Keys.aiBaseURL) ?? ""
         self.aiAPIKey = defaults.string(forKey: Keys.aiAPIKey) ?? ""
-        self.aiModel = defaults.string(forKey: Keys.aiModel) ?? Defaults.aiModel
+        self.aiModel = defaults.string(forKey: Keys.aiModel) ?? ""
         self.aiTimeout = defaults.integer(forKey: Keys.aiTimeout)
         self.uploadQuality = defaults.integer(forKey: Keys.uploadQuality)
         self.uploadStatus = defaults.integer(forKey: Keys.uploadStatus)
-        self.uploadDir = defaults.string(forKey: Keys.uploadDir) ?? Defaults.uploadDir
-        self.uploadBucket = defaults.string(forKey: Keys.uploadBucket) ?? Defaults.uploadBucket
+        self.uploadDir = defaults.string(forKey: Keys.uploadDir) ?? ""
+        self.uploadBucket = defaults.string(forKey: Keys.uploadBucket) ?? ""
+        self.uploadRootDir = defaults.string(forKey: Keys.uploadRootDir) ?? "IMAGES"
+
+        // 加载工作流配置，默认使用壁纸上传模板
+        if let saved = defaults.string(forKey: Keys.selectedWorkflow), !saved.isEmpty,
+           let data = saved.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           WorkflowConfig(json: json) != nil {
+            self.selectedWorkflow = saved
+        } else if let config = TemplateStore.wallpaper {
+            self.selectedWorkflow = Self.serializeConfig(config)
+        } else {
+            self.selectedWorkflow = "{}"
+        }
+    }
+
+    /// 设置工作流为指定配置
+    func setWorkflow(_ config: WorkflowConfig) {
+        self.selectedWorkflow = Self.serializeConfig(config)
+    }
+
+    /// 将 WorkflowConfig 序列化为 JSON 字符串
+    static func serializeConfig(_ config: WorkflowConfig) -> String {
+        var json: [String: Any] = [
+            "name": config.name,
+            "description": config.description,
+            "version": config.version,
+        ]
+
+        // AI
+        json["ai"] = [
+            "output_fields": config.ai.outputFields.map { f -> [String: Any] in
+                var d: [String: Any] = ["name": f.name, "type": f.type, "description": f.description]
+                if let e = f.entityName { d["entity"] = e }
+                return d
+            }
+        ]
+
+        // Entities
+        var entitiesJson: [String: Any] = [:]
+        for e in config.entities {
+            entitiesJson[e.name] = [
+                "list_path": e.listPath,
+                "create_path": e.createPath,
+                "create_body": e.createBody,
+            ]
+        }
+        json["entities"] = entitiesJson
+
+        // Upload
+        var fieldsJson: [String: Any] = [:]
+        for (fName, fSource) in config.upload.fields {
+            var d: [String: Any] = ["source": fSource.source]
+            if let v = fSource.field { d["field"] = v }
+            if let v = fSource.key { d["key"] = v }
+            if let v = fSource.value { d["value"] = v }
+            if let v = fSource.separator { d["separator"] = v }
+            if let v = fSource.entity { d["entity"] = v }
+            fieldsJson[fName] = d
+        }
+        json["upload"] = [
+            "path": config.upload.path,
+            "fields": fieldsJson,
+        ]
+
+        guard let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]),
+              let str = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return str
     }
 }
 
-// MARK: - Keys & Defaults
+// MARK: - Keys
 
 private enum Keys {
     static let apiBaseURL = "api_base_url"
@@ -95,15 +189,6 @@ private enum Keys {
     static let uploadStatus = "upload_status"
     static let uploadDir = "upload_dir"
     static let uploadBucket = "upload_bucket"
-}
-
-enum Defaults {
-    static let apiBaseURL = "https://wallpaper.boyyang.cn"
-    static let aiBaseURL = "https://token-plan-cn.xiaomimimo.com/v1"
-    static let aiModel = "mimo-v2.5"
-    static let aiTimeout = 60
-    static let uploadQuality = 5
-    static let uploadStatus = 1
-    static let uploadDir = "PCANDMOA"
-    static let uploadBucket = "wallpaper"
+    static let uploadRootDir = "upload_root_dir"
+    static let selectedWorkflow = "selected_workflow"
 }

@@ -15,10 +15,9 @@ enum ImageStatus: Equatable {
     case analyzing
     case analyzed
     case uploading
-    case success(String)   // upload ID
-    case failed(String)    // error message
+    case success(String)
+    case failed(String)
 
-    /// 是否可以重新分析
     var canReAnalyze: Bool {
         switch self {
         case .analyzed, .failed: return true
@@ -26,13 +25,11 @@ enum ImageStatus: Equatable {
         }
     }
 
-    /// 是否可以重新上传（失败的）
     var canReUpload: Bool {
         if case .failed = self { return true }
         return false
     }
 
-    /// 失败原因
     var errorMessage: String? {
         if case .failed(let msg) = self {
             let trimmed = msg.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -48,13 +45,15 @@ struct ImageItem: Identifiable, Equatable {
     let path: String
     let fileName: String
     let thumbnail: NSImage?
-    let isPortrait: Bool   // true=MOA, false=PC
+    let isPortrait: Bool
 
     var analysis: ImageAnalysis?
     var status: ImageStatus = .pending
     var uploadProgress: Double = 0
 
-    static func == (lhs: ImageItem, rhs: ImageItem) -> Bool { lhs.id == rhs.id }
+    static func == (lhs: ImageItem, rhs: ImageItem) -> Bool {
+        lhs.id == rhs.id && lhs.status == rhs.status && lhs.analysis == rhs.analysis
+    }
 }
 
 // MARK: - ViewModel
@@ -67,10 +66,8 @@ final class UploadViewModel {
     var selectedIDs: Set<String> = []
     var isAnalyzing = false
     var isUploading = false
-    var refreshID = UUID()  // 用于强制触发视图刷新
+    var refreshID = UUID()
     var errorMessage: String?
-
-    // MARK: - 计算属性
 
     var hasImages: Bool { !images.isEmpty }
     var selectedCount: Int { selectedIDs.count }
@@ -90,7 +87,6 @@ final class UploadViewModel {
             return false
         }.count
     }
-
     var isAllSelected: Bool {
         !images.isEmpty && selectedIDs.count == images.count
     }
@@ -164,10 +160,17 @@ final class UploadViewModel {
         else { selectedIDs = Set(images.map(\.id)) }
     }
 
+    // MARK: - API Client 工厂
+
+    private func makeAPIClient(settings: AppSettings) -> APIClient {
+        APIClient(baseURL: settings.apiBaseURL, token: settings.apiToken)
+    }
+
     // MARK: - 单张重新分析
 
     func reAnalyzeImage(id: String, settings: AppSettings) async {
-        guard let idx = images.firstIndex(where: { $0.id == id }) else { return }
+        guard let idx = images.firstIndex(where: { $0.id == id }),
+              let workflow = settings.workflow else { return }
 
         images[idx].status = .analyzing
         images[idx].analysis = nil
@@ -180,10 +183,10 @@ final class UploadViewModel {
             timeout: settings.aiTimeout
         )
 
-        let prompt = await buildAnalysisPrompt(settings: settings)
+        let prompt = await buildAnalysisPrompt(settings: settings, workflow: workflow)
 
         do {
-            let analysis = try await ai.analyze(imagePath: images[idx].path, prompt: prompt)
+            let analysis = try await ai.analyze(imagePath: images[idx].path, prompt: prompt, outputFields: workflow.ai.outputFields)
             images[idx].analysis = analysis
             images[idx].status = .analyzed
         } catch {
@@ -197,49 +200,27 @@ final class UploadViewModel {
 
     func reUploadImage(id: String, settings: AppSettings) async {
         guard let idx = images.firstIndex(where: { $0.id == id }),
-              let analysis = images[idx].analysis
+              let analysis = images[idx].analysis,
+              let workflow = settings.workflow
         else { return }
 
         images[idx].status = .uploading
         images[idx].uploadProgress = 0
         refreshID = UUID()
 
-        let api = WallpaperAPIClient(baseURL: settings.apiBaseURL, token: settings.apiToken)
-        _ = try? await api.fetchTags()
-        _ = try? await api.fetchCategories()
-        _ = try? await api.fetchRecommends()
+        let api = makeAPIClient(settings: settings)
 
         do {
-            let fileName = sanitizeSEOName(analysis.seoName)
-            let imgType = images[idx].isPortrait ? "MOA" : "PC"
-
-            let tagIDs = try await withThrowingTaskGroup(of: String.self) { group in
-                for tag in analysis.tags {
-                    group.addTask { try await api.matchOrCreateTag(tag) }
-                }
-                var ids: [String] = []
-                for try await id in group { ids.append(id) }
-                return ids
-            }
-
-            let categoryID = try await api.matchOrCreateCategory(analysis.category)
-
-            let recommendIDs = try await withThrowingTaskGroup(of: String.self) { group in
-                for rec in analysis.recommend {
-                    group.addTask { try await api.matchOrCreateRecommend(rec) }
-                }
-                var ids: [String] = []
-                for try await id in group { ids.append(id) }
-                return ids
-            }
+            let uploadFields = try await resolveUploadFields(
+                analysis: analysis, workflow: workflow,
+                settings: settings, api: api,
+                isPortrait: images[idx].isPortrait
+            )
 
             let uploadID = try await api.uploadImage(
-                filePath: images[idx].path, fileName: fileName, type: imgType,
-                quality: settings.uploadQuality, status: settings.uploadStatus,
-                rootDir: "IMAGES", dir: settings.uploadDir,
-                bucketName: settings.uploadBucket,
-                tagIDs: tagIDs, categoryIDs: [categoryID],
-                recommendIDs: recommendIDs
+                uploadPath: workflow.upload.path,
+                filePath: images[idx].path,
+                fields: uploadFields
             ) { [weak self] progress in
                 Task { @MainActor in
                     self?.images[idx].uploadProgress = progress
@@ -256,52 +237,28 @@ final class UploadViewModel {
 
     // MARK: - 构建分析 Prompt
 
-    private func buildAnalysisPrompt(settings: AppSettings) async -> String {
-        let api = WallpaperAPIClient(baseURL: settings.apiBaseURL, token: settings.apiToken)
-        var categoryNames: [String] = []
-        var tagNames: [String] = []
-        var recommendNames: [String] = []
-        do {
-            let cats = try await api.fetchCategories()
-            let tags = try await api.fetchTags()
-            let recs = try await api.fetchRecommends()
-            categoryNames = cats.map(\.name)
-            tagNames = tags.map(\.name)
-            recommendNames = recs.map(\.name)
-        } catch {}
+    private func buildAnalysisPrompt(settings: AppSettings, workflow: WorkflowConfig) async -> String {
+        let api = makeAPIClient(settings: settings)
 
-        let base = """
-        你是壁纸分类专家。分析这张图片，返回 JSON 格式：
-        {
-          "name": "简短的中文图片名称（5-30字）",
-          "description": "图片内容简述",
-          "seo_name": "SEO友好的中文文件名（用空格分隔，2-8个关键词）",
-          "category": "从已有分类列表中选一个最匹配的",
-          "tags": ["标签1", "标签2", "标签3"],
-          "recommend": ["推荐标签1", "推荐标签2"]
+        var existingDataParts: [String] = []
+        for entity in workflow.entities {
+            do {
+                let records = try await api.listEntities(path: entity.listPath)
+                let names = records.map(\.name)
+                if !names.isEmpty {
+                    existingDataParts.append("- \(entity.name)（优先从中选）：\(names.joined(separator: "、"))")
+                }
+            } catch {}
         }
-        要求：
-        - category 必须从「已有分类」中选择，不能自创
-        - tags 3-20个，优先从已有标签中选，没有合适的可自创
-        - recommend 1-2个，优先从已有推荐标签中选
-        - seo_name 必须是中文，用空格分隔关键词
-        - 所有文本用中文
-        - 只返回 JSON，不要其他内容
-        """
 
-        return base + """
-
-        当前系统已有数据（必须从中选择，不要自创）：
-        - 分类（必须从中选1个）：\(categoryNames.isEmpty ? "暂无，请自创" : categoryNames.joined(separator: "、"))
-        - 标签（优先从中选，不够可自创）：\(tagNames.isEmpty ? "暂无，请自创" : tagNames.joined(separator: "、"))
-        - 推荐标签（优先从中选，不够可自创）：\(recommendNames.isEmpty ? "暂无，请自创" : recommendNames.joined(separator: "、"))
-        """
+        let existingData = existingDataParts.isEmpty ? nil : existingDataParts.joined(separator: "\n")
+        return workflow.generateAIPrompt(existingData: existingData)
     }
 
     // MARK: - AI 分析
 
     func analyzeImages(settings: AppSettings) async {
-        guard !selectedIDs.isEmpty else { return }
+        guard !selectedIDs.isEmpty, let workflow = settings.workflow else { return }
 
         isAnalyzing = true
         errorMessage = nil
@@ -313,7 +270,7 @@ final class UploadViewModel {
             timeout: settings.aiTimeout
         )
 
-        let dynamicPrompt = await buildAnalysisPrompt(settings: settings)
+        let dynamicPrompt = await buildAnalysisPrompt(settings: settings, workflow: workflow)
 
         for i in images.indices {
             guard selectedIDs.contains(images[i].id) else { continue }
@@ -322,20 +279,22 @@ final class UploadViewModel {
             images[i].status = .analyzing
 
             do {
-                let analysis = try await ai.analyze(imagePath: images[i].path, prompt: dynamicPrompt)
+                let analysis = try await ai.analyze(imagePath: images[i].path, prompt: dynamicPrompt, outputFields: workflow.ai.outputFields)
+                print("🔍 分析结果 [\(images[i].fileName)]:")
+                for field in analysis.orderedFields {
+                    print("   \(field.key) = \(field.value)")
+                }
                 images[i].analysis = analysis
                 images[i].status = .analyzed
             } catch {
                 images[i].status = .failed("分析失败: \(formatUploadError(error))")
             }
 
-            // 避免请求过快
             if i < images.count - 1 {
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
 
-        // 强制触发视图刷新（拷贝触发 @Observable 变更通知）
         let snapshot = images
         images = snapshot
         refreshID = UUID()
@@ -345,6 +304,7 @@ final class UploadViewModel {
     // MARK: - 上传
 
     func uploadImages(settings: AppSettings, dryRun: Bool = false, modelContext: ModelContext? = nil) async {
+        guard let workflow = settings.workflow else { return }
         let toUpload = images.filter { selectedIDs.contains($0.id) && $0.status == .analyzed }
         print("📤 上传开始: 待上传 \(toUpload.count) 张, 干运行=\(dryRun)")
         guard !toUpload.isEmpty else { return }
@@ -352,16 +312,11 @@ final class UploadViewModel {
         isUploading = true
         errorMessage = nil
 
-        let api = WallpaperAPIClient(baseURL: settings.apiBaseURL, token: settings.apiToken)
+        let api = makeAPIClient(settings: settings)
 
-        // 预加载标签/分类/推荐
-        do {
-            let tags = try await api.fetchTags()
-            let cats = try await api.fetchCategories()
-            let recs = try await api.fetchRecommends()
-            print("📋 预加载: \(tags.count)标签, \(cats.count)分类, \(recs.count)推荐")
-        } catch {
-            print("❌ 预加载失败: \(error)")
+        // 预加载所有实体列表（缓存）
+        for entity in workflow.entities {
+            _ = try? await api.listEntities(path: entity.listPath)
         }
 
         for item in toUpload {
@@ -376,39 +331,18 @@ final class UploadViewModel {
 
             images[idx].status = .uploading
             images[idx].uploadProgress = 0
-            print("⬆️ 上传 [\(item.fileName)] type=\(item.isPortrait ? "MOA" : "PC") fileName=\(sanitizeSEOName(analysis.seoName))")
 
             do {
-                let fileName = sanitizeSEOName(analysis.seoName)
-                let imgType = item.isPortrait ? "MOA" : "PC"
-
-                let tagIDs = try await withThrowingTaskGroup(of: String.self) { group in
-                    for tag in analysis.tags {
-                        group.addTask { try await api.matchOrCreateTag(tag) }
-                    }
-                    var ids: [String] = []
-                    for try await id in group { ids.append(id) }
-                    return ids
-                }
-
-                let categoryID = try await api.matchOrCreateCategory(analysis.category)
-
-                let recommendIDs = try await withThrowingTaskGroup(of: String.self) { group in
-                    for rec in analysis.recommend {
-                        group.addTask { try await api.matchOrCreateRecommend(rec) }
-                    }
-                    var ids: [String] = []
-                    for try await id in group { ids.append(id) }
-                    return ids
-                }
+                let uploadFields = try await resolveUploadFields(
+                    analysis: analysis, workflow: workflow,
+                    settings: settings, api: api,
+                    isPortrait: item.isPortrait
+                )
 
                 let uploadID = try await api.uploadImage(
-                    filePath: item.path, fileName: fileName, type: imgType,
-                    quality: settings.uploadQuality, status: settings.uploadStatus,
-                    rootDir: "IMAGES", dir: settings.uploadDir,
-                    bucketName: settings.uploadBucket,
-                    tagIDs: tagIDs, categoryIDs: [categoryID],
-                    recommendIDs: recommendIDs
+                    uploadPath: workflow.upload.path,
+                    filePath: item.path,
+                    fields: uploadFields
                 ) { [weak self] progress in
                     Task { @MainActor in
                         self?.images[idx].uploadProgress = progress
@@ -422,7 +356,6 @@ final class UploadViewModel {
                 print("❌ 上传失败 [\(item.fileName)]: \(error)")
             }
 
-            // 避免并发过高
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
 
@@ -441,8 +374,8 @@ final class UploadViewModel {
                     fileName: img.fileName, filePath: img.path,
                     imageType: img.isPortrait ? "MOA" : "PC",
                     status: statusStr, uploadID: uploadID, errorMessage: errorMsg,
-                    category: img.analysis?.category ?? "",
-                    tags: (img.analysis?.tags ?? []).joined(separator: ",")
+                    category: img.analysis?.string("category") ?? "",
+                    tags: (img.analysis?.array("tags") ?? []).joined(separator: ",")
                 )
             }
             let record = UploadRecord(
@@ -459,16 +392,116 @@ final class UploadViewModel {
         isUploading = false
     }
 
-    private func sanitizeSEOName(_ name: String) -> String {
-        var result = name.replacingOccurrences(
-            of: "[^\\w\\s\\u4e00-\\u9fff]",
-            with: " ", options: .regularExpression
-        )
-        result = result.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        result = result.trimmingCharacters(in: .whitespacesAndNewlines)
-        if result.isEmpty { result = "壁纸" }
-        if result.count > 50 { result = String(result.prefix(50)).trimmingCharacters(in: .whitespaces) }
-        return result
+    // MARK: - Resolve Upload Fields
+
+    /// 根据工作流配置解析上传字段
+    private func resolveUploadFields(
+        analysis: ImageAnalysis,
+        workflow: WorkflowConfig,
+        settings: AppSettings,
+        api: APIClient,
+        isPortrait: Bool
+    ) async throws -> [String: String] {
+        var fields: [String: String] = [:]
+        print("📋 resolveUploadFields: entities=\(workflow.entities.map(\.name)) analysisFields=\(analysis.orderedFields.map(\.key))")
+
+        for (fieldName, source) in workflow.upload.fields {
+            switch source.source {
+            case "file":
+                // 文件字段在 uploadImage 中单独处理
+                continue
+
+            case "ai":
+                let aiField = source.field ?? fieldName
+                if let sep = source.separator {
+                    fields[fieldName] = analysis.array(aiField).joined(separator: sep)
+                } else {
+                    fields[fieldName] = analysis.string(aiField)
+                }
+
+            case "entity_ids":
+                let aiField = source.field ?? fieldName
+                let entityName = source.entity ?? source.field ?? fieldName
+                print("🔗 entity_ids: fieldName=\(fieldName) aiField=\(aiField) entityName=\(entityName)")
+                // 找到对应的实体配置：先按 entity 名找，找不到再按 outputField 的 entityName 找
+                var entityConfig = workflow.entities.first(where: { $0.name == entityName })
+                if entityConfig == nil {
+                    // 回退：用 AI outputField 的 entityName 匹配
+                    if let outputField = workflow.ai.outputFields.first(where: { $0.name == aiField }),
+                       let fallbackEntity = outputField.entityName {
+                        entityConfig = workflow.entities.first(where: { $0.name == fallbackEntity })
+                        if entityConfig != nil {
+                            print("🔗 回退到 outputField.entityName=\(fallbackEntity)")
+                        }
+                    }
+                }
+                guard let entityConfig else {
+                    print("⚠️ 未找到实体配置: \(entityName)，可用: \(workflow.entities.map(\.name))")
+                    fields[fieldName] = analysis.string(aiField)
+                    continue
+                }
+
+                // 尝试数组类型（如 tags），否则按字符串处理
+                let arrayValue = analysis.array(aiField)
+                print("🔗 \(aiField) arrayValue=\(arrayValue)")
+                if !arrayValue.isEmpty {
+                    // 数组类型：批量匹配或创建
+                    var ids: [String] = []
+                    for name in arrayValue {
+                        let id = try await api.matchOrCreate(
+                            name: name,
+                            listPath: entityConfig.listPath,
+                            createPath: entityConfig.createPath,
+                            createBody: entityConfig.createBody
+                        )
+                        ids.append(id)
+                    }
+                    fields[fieldName] = ids.joined(separator: source.separator ?? ",")
+                } else {
+                    let stringValue = analysis.string(aiField)
+                    if !stringValue.isEmpty {
+                        // 字符串类型：单个匹配或创建
+                        let id = try await api.matchOrCreate(
+                            name: stringValue,
+                            listPath: entityConfig.listPath,
+                            createPath: entityConfig.createPath,
+                            createBody: entityConfig.createBody
+                        )
+                        fields[fieldName] = id
+                    }
+                }
+
+            case "setting":
+                let key = source.key ?? fieldName
+                fields[fieldName] = resolveSetting(key: key, settings: settings, isPortrait: isPortrait)
+
+            case "value":
+                fields[fieldName] = source.value ?? ""
+
+            default:
+                break
+            }
+        }
+
+        return fields
+    }
+
+    /// 从 AppSettings 读取通用设置值
+    private func resolveSetting(key: String, settings: AppSettings, isPortrait: Bool) -> String {
+        switch key {
+        case "apiBaseURL": return settings.apiBaseURL
+        case "apiToken": return settings.apiToken
+        case "aiBaseURL": return settings.aiBaseURL
+        case "aiAPIKey": return settings.aiAPIKey
+        case "aiModel": return settings.aiModel
+        case "uploadQuality": return "\(settings.uploadQuality)"
+        case "uploadStatus": return "\(settings.uploadStatus)"
+        case "uploadDir": return settings.uploadDir
+        case "uploadBucket": return settings.uploadBucket
+        case "uploadRootDir": return settings.uploadRootDir
+        case "imageType": return isPortrait ? "MOA" : "PC"
+        default: return ""
+        }
     }
 
     private func formatUploadError(_ error: Error) -> String {
