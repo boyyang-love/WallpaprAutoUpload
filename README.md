@@ -111,7 +111,7 @@ WallpaperAutoUploadTool/
   "version": "1.0",
   "ai": {
     "output_fields": [
-      {"name": "字段名", "type": "string|array", "description": "AI 输出描述", "entity": "关联实体名（可选）"}
+      {"name": "字段名", "type": "string|array", "description": "AI 输出描述", "entity": "关联实体名（可选）", "min_items": "数组最少数量（可选）", "max_items": "数组最多数量（可选，AI 超出时截断）"}
     ]
   },
   "entities": {

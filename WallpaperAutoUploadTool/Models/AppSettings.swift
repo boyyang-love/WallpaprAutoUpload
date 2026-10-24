@@ -137,6 +137,8 @@ final class AppSettings {
             "output_fields": config.ai.outputFields.map { f -> [String: Any] in
                 var d: [String: Any] = ["name": f.name, "type": f.type, "description": f.description]
                 if let e = f.entityName { d["entity"] = e }
+                if let v = f.minItems { d["min_items"] = v }
+                if let v = f.maxItems { d["max_items"] = v }
                 return d
             }
         ]

@@ -442,9 +442,27 @@ final class VisionAIClient {
 
         var fields: [String: Any] = [:]
         for field in outputFields {
-            if let value = json[field.name] {
-                fields[field.name] = value
+            guard let value = json[field.name] else { continue }
+            var stored = value
+            // 数组字段：超过 max_items 时截断（AI 不总是遵守数量要求）
+            if field.type == "array", let max = field.maxItems {
+                var arr: [String]? = nil
+                if let a = value as? [String] {
+                    arr = a
+                } else if let a = value as? [Any] {
+                    arr = a.map { "\($0)" }
+                }
+                if let a = arr {
+                    if a.count > max {
+                        print("✂️ \(field.name) 返回 \(a.count) 个，超出上限 \(max)，截断")
+                        stored = Array(a.prefix(max))
+                    } else {
+                        stored = a
+                    }
+                }
+                // 非数组值保持原样，交由字符串分支处理
             }
+            fields[field.name] = stored
         }
         guard !fields.isEmpty else {
             print("⚠️ parseJSONString: 没有匹配到任何 outputFields")

@@ -26,6 +26,10 @@ struct WorkflowConfig {
         let type: String
         let description: String
         let entityName: String?
+        /// 数组字段最少数量（可选）
+        let minItems: Int?
+        /// 数组字段最多数量（可选，AI 超出时解析阶段截断）
+        let maxItems: Int?
     }
 
     struct EntityConfig {
@@ -70,7 +74,9 @@ struct WorkflowConfig {
                 fields.append(OutputField(
                     name: fname, type: ftype,
                     description: fdesc,
-                    entityName: f["entity"] as? String
+                    entityName: f["entity"] as? String,
+                    minItems: f["min_items"] as? Int,
+                    maxItems: f["max_items"] as? Int
                 ))
             }
         }
@@ -147,7 +153,9 @@ struct WorkflowConfig {
         for field in ai.outputFields {
             if let entityName = field.entityName {
                 if field.type == "array" {
-                    requirements.append("- \(field.description) 3-20个，优先从已有\(field.description)中选，没有合适的可自创")
+                    let min = field.minItems ?? 3
+                    let max = field.maxItems ?? 20
+                    requirements.append("- \(field.description) \(min)-\(max)个，优先从已有\(field.description)中选，没有合适的可自创")
                 } else {
                     requirements.append("- \(field.description) 必须从已有\(field.description)中选择，不能自创")
                 }
@@ -188,7 +196,7 @@ enum TemplateStore {
                 ["name": "seo_name", "type": "string", "description": "SEO友好的中文文件名（用空格分隔，2-8个关键词）"],
                 ["name": "category", "type": "string", "description": "分类", "entity": "category"],
                 ["name": "tags", "type": "array", "description": "标签", "entity": "tag"],
-                ["name": "recommend", "type": "array", "description": "推荐标签", "entity": "recommend"],
+                ["name": "recommend", "type": "array", "description": "推荐标签", "entity": "recommend", "min_items": 2, "max_items": 5],
             ]
         ],
         "entities": [
