@@ -1,33 +1,23 @@
 {
   "fill" : {
     "linear-gradient" : [
-      "extended-srgb:0.00000,0.76471,0.81569,1.00000",
-      "extended-srgb:0.38039,0.33333,0.96078,1.00000"
+      "extended-gray:1.00000,1.00000",
+      "extended-gray:1.00000,1.00000"
     ]
   },
   "groups" : [
     {
       "layers" : [
         {
-          "blend-mode" : "plus-darker",
-          "image-name" : "ROBOT.svg",
-          "name" : "ROBOT",
+          "blend-mode" : "normal",
+          "glass" : true,
+          "image-name" : "robot-2-fill.svg",
+          "name" : "robot-2-fill",
           "position" : {
-            "scale" : 3,
+            "scale" : 2,
             "translation-in-points" : [
-              200,
-              322
-            ]
-          }
-        },
-        {
-          "image-name" : "sun 2.svg",
-          "name" : "sun 2",
-          "position" : {
-            "scale" : 3,
-            "translation-in-points" : [
-              -282,
-              -231
+              0,
+              0
             ]
           }
         }
